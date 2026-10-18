@@ -152,11 +152,123 @@ def renewable_availability_profile(peak_index_pct: float) -> np.ndarray:
     return np.clip(normalized * peak_index_pct / 100.0, 0.0, 1.0)
 
 
+def waste_heat_availability_profile(profile_name: str) -> np.ndarray:
+    """Return a clearly synthetic availability shape for the thermal-store demo."""
+    if profile_name == "Parti üretim (sentetik)":
+        profile = np.full(24, 0.10, dtype=float)
+        profile[8:16] = 1.0
+        return profile
+    return np.ones(24, dtype=float)
+
+
+def simulate_thermal_storage(
+    *,
+    source_peak_kwth: float,
+    source_profile: np.ndarray,
+    source_temperature_c: float,
+    sink_temperature_c: float,
+    heat_demand_kwth: float,
+    furnace_duty_kwth: float,
+    storage_capacity_kwhth: float,
+    charge_limit_kwth: float,
+    discharge_limit_kwth: float,
+    heat_exchanger_efficiency: float,
+    charge_efficiency: float,
+    discharge_efficiency: float,
+    standing_loss_pct_day: float,
+) -> pd.DataFrame:
+    """Dispatch an illustrative sensible-heat store for a lower-temperature preheat load.
+
+    One row represents one hour. Heat is first used directly, then from existing storage,
+    and only then is surplus charged. It is not a model of the furnace hot zone.
+    """
+    hours = len(source_profile)
+    storage_capacity = max(0.0, float(storage_capacity_kwhth))
+    demand_limit = min(max(0.0, float(heat_demand_kwth)), max(0.0, float(furnace_duty_kwth)))
+    source_enabled = (
+        float(source_temperature_c) > float(sink_temperature_c)
+        and float(source_peak_kwth) > 0.0
+        and demand_limit > 0.0
+    )
+    hx_eff = float(np.clip(heat_exchanger_efficiency, 0.0, 1.0))
+    charge_eff = float(np.clip(charge_efficiency, 0.0, 1.0))
+    discharge_eff = float(np.clip(discharge_efficiency, 0.0, 1.0))
+    hourly_loss = float(np.clip(standing_loss_pct_day, 0.0, 100.0)) / 100.0 / max(hours, 1)
+    state_kwh = 0.0
+    rows: list[dict[str, float | str]] = []
+
+    for hour in range(hours):
+        state_kwh *= 1.0 - hourly_loss
+        source_kwth = (
+            max(0.0, float(source_peak_kwth)) * float(source_profile[hour])
+            if source_enabled
+            else 0.0
+        )
+        usable_source_kwh = source_kwth * hx_eff  # one-hour interval
+        demand_kwh = demand_limit
+
+        direct_heat_kwh = min(usable_source_kwh, demand_kwh)
+        remaining_demand_kwh = max(0.0, demand_kwh - direct_heat_kwh)
+        stored_energy_available_kwh = state_kwh * discharge_eff
+        discharged_heat_kwh = min(
+            remaining_demand_kwh,
+            max(0.0, float(discharge_limit_kwth)),
+            stored_energy_available_kwh,
+        )
+        if discharge_eff > 0.0:
+            state_kwh -= discharged_heat_kwh / discharge_eff
+        else:
+            discharged_heat_kwh = 0.0
+
+        source_surplus_kwh = max(0.0, usable_source_kwh - direct_heat_kwh)
+        charge_space_kwh = max(0.0, storage_capacity - state_kwh)
+        if charge_eff > 0.0:
+            charged_input_kwh = min(
+                source_surplus_kwh,
+                max(0.0, float(charge_limit_kwth)),
+                charge_space_kwh / charge_eff,
+            )
+            state_kwh += charged_input_kwh * charge_eff
+        else:
+            charged_input_kwh = 0.0
+        state_kwh = float(np.clip(state_kwh, 0.0, storage_capacity))
+        useful_heat_kwh = direct_heat_kwh + discharged_heat_kwh
+        rows.append(
+            {
+                "Saat": f"{hour:02d}:00",
+                "Atık ısı kaynağı (kWth)": source_kwth,
+                "Doğrudan kullanılan ısı (kWhth)": direct_heat_kwh,
+                "Depoya giren ısı (kWhth)": charged_input_kwh,
+                "Depodan çıkan ısı (kWhth)": discharged_heat_kwh,
+                "Faydalı ısı (kWhth)": useful_heat_kwh,
+                "Depo doluluğu (kWhth)": state_kwh,
+                "Kullanılmayan ısı (kWhth)": max(
+                    0.0, usable_source_kwh - direct_heat_kwh - charged_input_kwh
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def h2_blend_for_gas_saving(
+    gas_saving_fraction: float,
+    ng_lhv_mj_nm3: float,
+    h2_lhv_mj_nm3: float = H2_LHV_MJ_PER_NM3,
+) -> float:
+    """Solve the volume blend needed for a natural-gas volume reduction at equal duty."""
+    target = float(np.clip(gas_saving_fraction, 0.0, 0.999999))
+    denominator = h2_lhv_mj_nm3 + target * (ng_lhv_mj_nm3 - h2_lhv_mj_nm3)
+    if target <= 0.0 or denominator <= 0.0:
+        return 0.0
+    return float(np.clip(target * ng_lhv_mj_nm3 / denominator, 0.0, 1.0))
+
+
 def optimize_blend_schedule(
     availability: np.ndarray,
     safety_cap_fraction: float,
     hourly_supply_cap_fractions: np.ndarray,
     ng_lhv_mj_nm3: float,
+    max_ramp_fraction_per_hour: float = 0.03,
     h2_lhv_mj_nm3: float = H2_LHV_MJ_PER_NM3,
 ) -> np.ndarray:
     """Grid-search dispatch with availability, blend, supply and ramp penalty.
@@ -203,16 +315,17 @@ def optimize_blend_schedule(
             )
             continue
 
-        transition = scores[hour - 1, :, None] - ramp_penalty * np.abs(
-            candidates[None, :] - candidates[:, None]
-        ) * 100.0
+        ramp = np.abs(candidates[None, :] - candidates[:, None])
+        transition = scores[hour - 1, :, None] - ramp_penalty * ramp * 100.0
+        transition[ramp > max(0.0, max_ramp_fraction_per_hour) + 1e-10] = -np.inf
         best_parent = np.argmax(transition, axis=0)
         best_score = transition[best_parent, np.arange(state_count)]
         scores[hour, feasible] = reward[feasible] + best_score[feasible]
         parents[hour, feasible] = best_parent[feasible]
 
     schedule = np.zeros(hour_count)
-    state = int(np.argmax(scores[-1]))
+    terminal_scores = scores[-1] - ramp_penalty * np.abs(candidates) * 100.0
+    state = int(np.argmax(terminal_scores))
     for hour in range(hour_count - 1, -1, -1):
         schedule[hour] = candidates[state]
         if hour > 0:
@@ -232,16 +345,57 @@ def create_scenario(
     water_intensity_l_kg: float,
     ng_lhv_mj_nm3: float,
     ng_co2_kg_nm3: float,
+    furnace_thermal_efficiency: float,
     operating_days: int,
     electrolyzer_kwh_kg: float,
     oxygen_demand_kg_h: float,
     oxygen_use_efficiency: float,
     aeration_fan_kw: float,
     furnace_temperature_c: int,
-) -> tuple[pd.DataFrame, dict[str, float]]:
+    max_ramp_pct_per_hour: float,
+    heat_source_peak_kwth: float,
+    heat_source_profile_name: str,
+    heat_source_temperature_c: float,
+    heat_sink_temperature_c: float,
+    heat_demand_kwth: float,
+    heat_storage_capacity_kwhth: float,
+    heat_charge_limit_kwth: float,
+    heat_discharge_limit_kwth: float,
+    heat_exchanger_efficiency: float,
+    heat_charge_efficiency: float,
+    heat_discharge_efficiency: float,
+    heat_storage_loss_pct_day: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     availability = renewable_availability_profile(peak_index_pct)
     # A project-configured demo ceiling, not a universal standard limit.
     safety_cap = min(float(safety_cap_pct), H2_SIMULATION_HARD_CAP_PCT) / 100.0
+
+    heat_profile = waste_heat_availability_profile(heat_source_profile_name)
+    furnace_efficiency = float(np.clip(furnace_thermal_efficiency, 0.01, 1.0))
+    furnace_duty_kwth = gas_flow_nm3_h * ng_lhv_mj_nm3 / 3.6 * furnace_efficiency
+    heat_frame = simulate_thermal_storage(
+        source_peak_kwth=heat_source_peak_kwth,
+        source_profile=heat_profile,
+        source_temperature_c=heat_source_temperature_c,
+        sink_temperature_c=heat_sink_temperature_c,
+        heat_demand_kwth=heat_demand_kwth,
+        furnace_duty_kwth=furnace_duty_kwth,
+        storage_capacity_kwhth=heat_storage_capacity_kwhth,
+        charge_limit_kwth=heat_charge_limit_kwth,
+        discharge_limit_kwth=heat_discharge_limit_kwth,
+        heat_exchanger_efficiency=heat_exchanger_efficiency,
+        charge_efficiency=heat_charge_efficiency,
+        discharge_efficiency=heat_discharge_efficiency,
+        standing_loss_pct_day=heat_storage_loss_pct_day,
+    )
+    heat_used_kwh = heat_frame["Faydalı ısı (kWhth)"].to_numpy(dtype=float)
+    heat_gas_equivalent_nm3_h = np.minimum(
+        gas_flow_nm3_h,
+        heat_used_kwh * 3.6 / (ng_lhv_mj_nm3 * furnace_efficiency)
+        if ng_lhv_mj_nm3 > 0
+        else 0.0,
+    )
+    burner_ng_reference_nm3_h = np.maximum(0.0, gas_flow_nm3_h - heat_gas_equivalent_nm3_h)
 
     # External H2 availability and recovered-water treatment capacity both bind.
     water_limited_h2_kg_h = condensate_l_h / water_intensity_l_kg if water_intensity_l_kg else 0.0
@@ -253,23 +407,29 @@ def create_scenario(
         [
             blend_cap_from_h2_flow(
                 h2_kg_h / H2_DENSITY_KG_PER_NM3,
-                gas_flow_nm3_h,
+                burner_ng_reference_nm3_h[hour],
                 ng_lhv_mj_nm3,
             )
-            for h2_kg_h in hourly_h2_supply_kg_h
+            for hour, h2_kg_h in enumerate(hourly_h2_supply_kg_h)
         ]
     )
     blend = optimize_blend_schedule(
-        availability, safety_cap, hourly_supply_cap_fractions, ng_lhv_mj_nm3
+        availability,
+        safety_cap,
+        hourly_supply_cap_fractions,
+        ng_lhv_mj_nm3,
+        max_ramp_fraction_per_hour=max(0.0, float(max_ramp_pct_per_hour)) / 100.0,
     )
 
     rows: list[dict[str, Any]] = []
     for hour, blend_fraction in enumerate(blend):
         total_mix, h2_nm3_h, ng_nm3_h = blend_flows(
-            blend_fraction, gas_flow_nm3_h, ng_lhv_mj_nm3
+            blend_fraction, burner_ng_reference_nm3_h[hour], ng_lhv_mj_nm3
         )
         h2_kg_h = h2_nm3_h * H2_DENSITY_KG_PER_NM3
-        ng_avoided_nm3_h = max(0.0, gas_flow_nm3_h - ng_nm3_h)
+        ng_avoided_by_heat_nm3_h = heat_gas_equivalent_nm3_h[hour]
+        ng_avoided_by_h2_nm3_h = max(0.0, burner_ng_reference_nm3_h[hour] - ng_nm3_h)
+        ng_avoided_nm3_h = ng_avoided_by_heat_nm3_h + ng_avoided_by_h2_nm3_h
         process_water_l_h = h2_kg_h * water_intensity_l_kg
         oxygen_generated_kg_h = h2_kg_h * H2_OXYGEN_STOICH_KG_PER_KG
         oxygen_credited_kg_h = min(
@@ -286,8 +446,11 @@ def create_scenario(
                 "Yeşil enerji erişilebilirlik indeksi (%)": availability[hour] * 100.0,
                 "H2 harmanlama (vol %)": blend_fraction * 100.0,
                 "Baz doğalgaz (Nm³/saat)": gas_flow_nm3_h,
+                "Atık ısı sonrası brülör doğalgaz referansı (Nm³/saat)": burner_ng_reference_nm3_h[hour],
                 "Senaryo doğalgazı (Nm³/saat)": ng_nm3_h,
-                "Önlenen doğalgaz (Nm³/saat)": ng_avoided_nm3_h,
+                "Atık ısıyla önlenen doğalgaz (Nm³/saat)": ng_avoided_by_heat_nm3_h,
+                "H2 ile önlenen doğalgaz (Nm³/saat)": ng_avoided_by_h2_nm3_h,
+                "Toplam önlenen doğalgaz (Nm³/saat)": ng_avoided_nm3_h,
                 "Karışım toplamı (Nm³/saat)": total_mix,
                 "H2 beslemesi (Nm³/saat)": h2_nm3_h,
                 "H2 tüketimi (kg/saat)": h2_kg_h,
@@ -299,12 +462,16 @@ def create_scenario(
                 "Havalandırma fan gücü senaryosu (kW)": aeration_fan_kw
                 * oxygen_displacement_fraction,
                 "Önlenen doğrudan CO2 (kg/saat)": ng_avoided_nm3_h * ng_co2_kg_nm3,
+                "Faydalı atık ısı (kWhth/saat)": heat_used_kwh[hour],
             }
         )
 
     frame = pd.DataFrame(rows)
+    frame = frame.merge(heat_frame, on="Saat", how="left", validate="one_to_one")
     baseline_gas_day = gas_flow_nm3_h * 24.0
-    saved_gas_day = float(frame["Önlenen doğalgaz (Nm³/saat)"].sum())
+    saved_gas_day = float(frame["Toplam önlenen doğalgaz (Nm³/saat)"].sum())
+    h2_saved_gas_day = float(frame["H2 ile önlenen doğalgaz (Nm³/saat)"].sum())
+    heat_saved_gas_day = float(frame["Atık ısıyla önlenen doğalgaz (Nm³/saat)"].sum())
     h2_day_kg = float(frame["H2 tüketimi (kg/saat)"].sum())
     water_day_l = float(frame["Proses suyu (L/saat)"].sum())
     oxygen_day_kg = float(frame["Üretilen O2 (kg/saat)"].sum())
@@ -317,12 +484,29 @@ def create_scenario(
     peak_blend_pct = float(frame["H2 harmanlama (vol %)"].max())
     green_h2_power_day_kwh = h2_day_kg * electrolyzer_kwh_kg
     green_power_available_day_kwh = float(renewable_power_available_kw.sum())
+    useful_heat_day_kwh = float(heat_frame["Faydalı ısı (kWhth)"].sum())
+    heat_charged_day_kwh = float(heat_frame["Depoya giren ısı (kWhth)"].sum())
+    heat_discharged_day_kwh = float(heat_frame["Depodan çıkan ısı (kWhth)"].sum())
+    thermal_store_end_kwh = float(heat_frame["Depo doluluğu (kWhth)"].iloc[-1])
+    safety_ceiling_flows = blend_flows(safety_cap, gas_flow_nm3_h, ng_lhv_mj_nm3)
+    theoretical_safety_gas_saving_pct = (
+        max(0.0, gas_flow_nm3_h - safety_ceiling_flows[2]) / gas_flow_nm3_h * 100.0
+        if gas_flow_nm3_h > 0
+        else 0.0
+    )
+    effective_peak_power_kw = float(np.max(renewable_power_available_kw)) if len(renewable_power_available_kw) else 0.0
+    peak_power_h2_kg_h = effective_peak_power_kw / electrolyzer_kwh_kg if electrolyzer_kwh_kg > 0 else 0.0
+    safety_h2_flow_kg_h = safety_ceiling_flows[1] * H2_DENSITY_KG_PER_NM3
 
     summary = {
         "baseline_gas_day_nm3": baseline_gas_day,
         "saved_gas_day_nm3": saved_gas_day,
         "projected_gas_day_nm3": projected_gas_day,
         "gas_saving_pct": saved_gas_day / baseline_gas_day * 100.0 if baseline_gas_day else 0.0,
+        "h2_saved_gas_day_nm3": h2_saved_gas_day,
+        "heat_saved_gas_day_nm3": heat_saved_gas_day,
+        "h2_saving_pct": h2_saved_gas_day / baseline_gas_day * 100.0 if baseline_gas_day else 0.0,
+        "heat_saving_pct": heat_saved_gas_day / baseline_gas_day * 100.0 if baseline_gas_day else 0.0,
         "h2_day_kg": h2_day_kg,
         "water_day_l": water_day_l,
         "water_available_day_l": condensate_l_h * 24.0,
@@ -348,12 +532,29 @@ def create_scenario(
         "green_power_utilization_pct": green_h2_power_day_kwh / green_power_available_day_kwh * 100.0
         if green_power_available_day_kwh > 0
         else 0.0,
+        "useful_heat_day_kwh": useful_heat_day_kwh,
+        "heat_charged_day_kwh": heat_charged_day_kwh,
+        "heat_discharged_day_kwh": heat_discharged_day_kwh,
+        "thermal_store_end_kwh": thermal_store_end_kwh,
+        "thermal_store_capacity_kwh": float(heat_storage_capacity_kwhth),
+        "thermal_heat_enabled": float(
+            heat_source_temperature_c > heat_sink_temperature_c
+            and heat_source_peak_kwth > 0.0
+            and heat_demand_kwth > 0.0
+        ),
+        "theoretical_safety_gas_saving_pct": theoretical_safety_gas_saving_pct,
+        "effective_peak_power_kw": effective_peak_power_kw,
+        "peak_power_h2_kg_h": peak_power_h2_kg_h,
+        "peak_h2_flow_kg_h": float(frame["H2 tüketimi (kg/saat)"].max()),
+        "safety_h2_flow_kg_h": safety_h2_flow_kg_h,
+        "max_ramp_pct_per_hour": float(max_ramp_pct_per_hour),
         "operating_days": float(operating_days),
         "furnace_temperature_c": float(furnace_temperature_c),
+        "furnace_thermal_efficiency_pct": furnace_efficiency * 100.0,
         "available_h2_kg_h": available_h2_kg_h,
         "water_limited_h2_kg_h": water_limited_h2_kg_h,
     }
-    return frame, summary
+    return frame, heat_frame, summary
 
 
 def format_number(value: float, decimals: int = 0) -> str:
@@ -430,6 +631,13 @@ with st.sidebar:
         value=220.0,
         step=10.0,
     )
+    target_savings_pct = st.slider(
+        "Doğalgaz ikamesi hedefi (%)",
+        min_value=1,
+        max_value=20,
+        value=10,
+        help="H₂ ve ısı geri kazanım kısıtlarıyla karşılaştırılan planlama hedefidir; gerçekleşme garantisi değildir.",
+    )
 
     with st.expander("Gelişmiş mühendislik varsayımları", expanded=False):
         ng_lhv = st.number_input(
@@ -448,6 +656,14 @@ with st.sidebar:
             format="%.3f",
             help="Varsayılan: IPCC 56,1 kg CO₂/GJ × 35,8 MJ/Nm³. Yerel yakıt analiziyle güncelleyin.",
         )
+        furnace_efficiency_pct = st.number_input(
+            "Baz fırın yararlı ısı verimi (%)",
+            min_value=1.0,
+            max_value=100.0,
+            value=85.0,
+            step=1.0,
+            help="Isı geri kazanımının yararlı proses ısısından doğalgaz girdisine çevrimi için senaryo varsayımıdır.",
+        )
         water_intensity = st.number_input(
             "Toplam elektroliz suyu ihtiyacı (L/kg H₂)",
             min_value=9.0,
@@ -462,6 +678,14 @@ with st.sidebar:
             max_value=90.0,
             value=55.0,
             step=1.0,
+        )
+        max_ramp_pct_per_hour = st.number_input(
+            "H₂ setpoint değişim üst sınırı (yüzde puan/saat)",
+            min_value=0.25,
+            max_value=20.0,
+            value=3.0,
+            step=0.25,
+            help="Optimizasyona uygulanan demo kısıtıdır; gerçek brülör rampası OEM ve saha mühendisliğiyle belirlenmelidir.",
         )
         operating_days = st.number_input(
             "Yıllık işletme günü", min_value=1, max_value=365, value=330, step=1
@@ -490,6 +714,84 @@ with st.sidebar:
             max_value=100000.0,
             value=350.0,
             step=10.0,
+        )
+
+    with st.expander("Atık ısı depolama senaryosu", expanded=False):
+        st.caption(
+            "Varsayılanlar yalnızca görsel demo senaryosudur; ölçülmüş saha verisi değildir. "
+            "Düşük/orta sıcaklıklı ısı, fırının 1.000°C+ sıcak bölgesinin yerine değil, uygun bir ön ısıtma yüküne yöneltilir."
+        )
+        heat_source_profile_name = st.selectbox(
+            "Atık ısı erişim profili",
+            ["Parti üretim (sentetik)", "Sürekli (sentetik)"],
+            index=0,
+            help="Gerçek pilotta bu sentetik profil saatlik ölçüm serisiyle değiştirilmelidir.",
+        )
+        heat_source_peak_kwth = st.number_input(
+            "Geri kazanılabilir atık ısı piki (kWth)",
+            min_value=0.0,
+            max_value=100000.0,
+            value=400.0,
+            step=25.0,
+        )
+        heat_demand_kwth = st.number_input(
+            "Uygun ön ısıtma ısı talebi (kWth)",
+            min_value=0.0,
+            max_value=100000.0,
+            value=250.0,
+            step=25.0,
+            help="Fırın sıcak bölgesi değil; eşleşen sıcaklık seviyesindeki ölçülebilir ön ısıtma/yardımcı proses yükü.",
+        )
+        heat_storage_capacity_kwhth = st.number_input(
+            "Isıl depo kapasitesi (kWhth)",
+            min_value=0.0,
+            max_value=10000000.0,
+            value=2000.0,
+            step=100.0,
+        )
+        heat_charge_limit_kwth = st.number_input(
+            "Maksimum depo şarj gücü (kWth)",
+            min_value=0.0,
+            max_value=100000.0,
+            value=400.0,
+            step=25.0,
+        )
+        heat_discharge_limit_kwth = st.number_input(
+            "Maksimum depo deşarj gücü (kWth)",
+            min_value=0.0,
+            max_value=100000.0,
+            value=250.0,
+            step=25.0,
+        )
+        heat_source_temperature_c = st.number_input(
+            "Atık ısı kaynağı sıcaklığı (°C)",
+            min_value=0.0,
+            max_value=1800.0,
+            value=400.0,
+            step=10.0,
+        )
+        heat_sink_temperature_c = st.number_input(
+            "Ön ısıtma yükü hedef sıcaklığı (°C)",
+            min_value=0.0,
+            max_value=1800.0,
+            value=250.0,
+            step=10.0,
+        )
+        heat_exchanger_efficiency_pct = st.slider(
+            "Isı eşanjörü etkinliği (%)", min_value=0, max_value=100, value=85
+        )
+        heat_charge_efficiency_pct = st.slider(
+            "Depo şarj etkinliği (%)", min_value=0, max_value=100, value=90
+        )
+        heat_discharge_efficiency_pct = st.slider(
+            "Depo deşarj etkinliği (%)", min_value=0, max_value=100, value=90
+        )
+        heat_storage_loss_pct_day = st.number_input(
+            "Depo bekleme kaybı (%/gün)",
+            min_value=0.0,
+            max_value=100.0,
+            value=1.0,
+            step=0.5,
         )
 
     with st.expander("Finansal senaryo varsayımları", expanded=False):
@@ -530,8 +832,58 @@ with st.sidebar:
             value=0.0,
             step=5000.0,
         )
+        electrolyzer_capex_eur = st.number_input(
+            "Elektrolizör ve güç elektroniği yatırım bedeli (€)",
+            min_value=0.0,
+            max_value=1000000000.0,
+            value=0.0,
+            step=10000.0,
+        )
+        hydrogen_system_capex_eur = st.number_input(
+            "H₂ şartlandırma / sıkıştırma / depolama bedeli (€)",
+            min_value=0.0,
+            max_value=1000000000.0,
+            value=0.0,
+            step=10000.0,
+        )
+        water_system_capex_eur = st.number_input(
+            "Su arıtma ve kalite kontrol yatırımı (€)",
+            min_value=0.0,
+            max_value=1000000000.0,
+            value=0.0,
+            step=5000.0,
+        )
+        thermal_storage_capex_eur = st.number_input(
+            "Isı eşanjörü ve ısıl depo yatırımı (€)",
+            min_value=0.0,
+            max_value=1000000000.0,
+            value=0.0,
+            step=10000.0,
+        )
+        other_site_capex_eur = st.number_input(
+            "Mühendislik / saha entegrasyonu / diğer CAPEX (€)",
+            min_value=0.0,
+            max_value=1000000000.0,
+            value=0.0,
+            step=5000.0,
+        )
+        green_electricity_price_eur_mwh = st.number_input(
+            "Yeşil elektriğin fırsat maliyeti (€/MWh)",
+            min_value=0.0,
+            max_value=10000.0,
+            value=0.0,
+            step=5.0,
+            help="0 değeri yalnızca gerçekten yedek/curtailed enerji varsayımında kullanılmalıdır.",
+        )
         annual_software_opex_eur = st.number_input(
             "Yıllık lisans ve yazılım OPEX (€)",
+            min_value=0.0,
+            max_value=100000000.0,
+            value=0.0,
+            step=1000.0,
+        )
+        annual_plant_opex_eur = st.number_input(
+            "Yıllık bakım / su / saha işletme OPEX (€)",
             min_value=0.0,
             max_value=100000000.0,
             value=0.0,
@@ -545,7 +897,7 @@ with st.sidebar:
     )
 
 
-scenario, totals = create_scenario(
+scenario, heat_storage, totals = create_scenario(
     sector=sector,
     gas_flow_nm3_h=gas_flow,
     peak_index_pct=green_peak,
@@ -556,12 +908,82 @@ scenario, totals = create_scenario(
     water_intensity_l_kg=water_intensity,
     ng_lhv_mj_nm3=ng_lhv,
     ng_co2_kg_nm3=ng_co2_factor,
+    furnace_thermal_efficiency=furnace_efficiency_pct / 100.0,
     operating_days=int(operating_days),
     electrolyzer_kwh_kg=electrolyzer_kwh_kg,
     oxygen_demand_kg_h=oxygen_demand,
     oxygen_use_efficiency=oxygen_use_pct / 100.0,
     aeration_fan_kw=aeration_fan_kw,
     furnace_temperature_c=int(furnace_temperature),
+    max_ramp_pct_per_hour=max_ramp_pct_per_hour,
+    heat_source_peak_kwth=heat_source_peak_kwth,
+    heat_source_profile_name=heat_source_profile_name,
+    heat_source_temperature_c=heat_source_temperature_c,
+    heat_sink_temperature_c=heat_sink_temperature_c,
+    heat_demand_kwth=heat_demand_kwth,
+    heat_storage_capacity_kwhth=heat_storage_capacity_kwhth,
+    heat_charge_limit_kwth=heat_charge_limit_kwth,
+    heat_discharge_limit_kwth=heat_discharge_limit_kwth,
+    heat_exchanger_efficiency=heat_exchanger_efficiency_pct / 100.0,
+    heat_charge_efficiency=heat_charge_efficiency_pct / 100.0,
+    heat_discharge_efficiency=heat_discharge_efficiency_pct / 100.0,
+    heat_storage_loss_pct_day=heat_storage_loss_pct_day,
+)
+
+target_blend_fraction = (
+    h2_blend_for_gas_saving(target_savings_pct / 100.0, ng_lhv)
+    if gas_flow > 0.0
+    else 0.0
+)
+target_blend_total_nm3_h, target_h2_nm3_h, target_ng_nm3_h = blend_flows(
+    target_blend_fraction, gas_flow, ng_lhv
+)
+target_h2_kg_h = target_h2_nm3_h * H2_DENSITY_KG_PER_NM3
+target_electrolyzer_kw = target_h2_kg_h * electrolyzer_kwh_kg
+target_water_l_h = target_h2_kg_h * water_intensity
+effective_safety_cap_pct = min(float(safety_cap_pct), H2_SIMULATION_HARD_CAP_PCT)
+target_h2_only_feasible_under_cap = (
+    gas_flow <= 0.0 or target_blend_fraction * 100.0 <= effective_safety_cap_pct + 1e-9
+)
+target_resource_coverages = {
+    "H₂ tedariki": h2_supply / target_h2_kg_h if target_h2_kg_h > 0 else float("inf"),
+    "Chiller suyu": condensate / target_water_l_h if target_water_l_h > 0 else float("inf"),
+    "Yeşil elektrik piki": totals["effective_peak_power_kw"] / target_electrolyzer_kw
+    if target_electrolyzer_kw > 0
+    else float("inf"),
+}
+target_bottleneck_name = (
+    "H₂ harman tavanı"
+    if not target_h2_only_feasible_under_cap
+    else min(target_resource_coverages, key=target_resource_coverages.get)
+)
+target_bottleneck_coverage_pct = (
+    min(100.0, target_resource_coverages[target_bottleneck_name] * 100.0)
+    if target_bottleneck_name in target_resource_coverages
+    and np.isfinite(target_resource_coverages[target_bottleneck_name])
+    else 100.0
+)
+target_savings_nm3_day = totals["baseline_gas_day_nm3"] * target_savings_pct / 100.0
+target_gap_after_scenario_nm3_day = max(
+    0.0, target_savings_nm3_day - totals["saved_gas_day_nm3"]
+)
+target_gap_heat_mwh_day = (
+    target_gap_after_scenario_nm3_day
+    * ng_lhv
+    / 3.6
+    * furnace_efficiency_pct
+    / 100.0
+    / 1000.0
+)
+target_required_green_peak_kw = (
+    target_electrolyzer_kw / (green_peak / 100.0)
+    if green_peak > 0
+    else float("inf")
+)
+target_required_green_peak_display = (
+    f"{format_number(target_required_green_peak_kw)} kW"
+    if np.isfinite(target_required_green_peak_kw)
+    else "yeşil enerji piki gerekli"
 )
 
 annual_fuel_savings_try = (
@@ -573,10 +995,25 @@ cbam_eligible_avoided_t = (
 )
 annual_cbam_scenario_eur = cbam_eligible_avoided_t * cbam_price_eur_t
 annual_gross_financial_gain_eur = annual_fuel_savings_eur + annual_cbam_scenario_eur
-annual_net_financial_gain_eur = annual_gross_financial_gain_eur - annual_software_opex_eur
+annual_hydrogen_electricity_mwh = totals["green_h2_power_day_mwh"] * int(operating_days)
+annual_electricity_cost_eur = annual_hydrogen_electricity_mwh * green_electricity_price_eur_mwh
+annual_total_opex_eur = (
+    annual_software_opex_eur + annual_plant_opex_eur + annual_electricity_cost_eur
+)
+total_system_capex_eur = sum(
+    [
+        software_setup_cost_eur,
+        electrolyzer_capex_eur,
+        hydrogen_system_capex_eur,
+        water_system_capex_eur,
+        thermal_storage_capex_eur,
+        other_site_capex_eur,
+    ]
+)
+annual_net_financial_gain_eur = annual_gross_financial_gain_eur - annual_total_opex_eur
 payback_years = (
-    software_setup_cost_eur / annual_net_financial_gain_eur
-    if software_setup_cost_eur > 0 and annual_net_financial_gain_eur > 0
+    total_system_capex_eur / annual_net_financial_gain_eur
+    if total_system_capex_eur > 0 and annual_net_financial_gain_eur > 0
     else None
 )
 
@@ -589,8 +1026,7 @@ st.markdown(
     <section class="hero">
       <div class="hero-kicker">Industrial energy digital twin · decision support</div>
       <h1>OptiHydro AI</h1>
-      <p>Fırın yakıt karışımını; yeşil enerji erişimi, güvenlik için tanımlanmış harman limiti,
-      H₂ beslemesi ve geri kazanılmış su kapasitesiyle birlikte senaryolaştırın.</p>
+      <p>Fırın yakıtını ve uygun ön ısıtma yüklerini; yeşil enerji, H₂, geri kazanılmış su ve ısıl depo sınırlarıyla birlikte senaryolaştırın.</p>
       <span class="hero-pill">{sector} · {format_number(gas_flow)} Nm³/saat baz yük</span>
       <span class="hero-pill">Açıklanabilir, kısıtlı dispatch</span>
       <span class="hero-pill">Canlı saha kontrolü değildir</span>
@@ -645,11 +1081,21 @@ k4.metric(
 
 st.caption(
     "CO₂ metriği doğrudan yanma emisyonu farkıdır; H₂'nin yaşam döngüsü emisyonlarını, "
-    "elektroliz elektriğini, NOₓ'i ve ekipman verim değişimini içermez."
+    f"elektroliz elektriğini, NOₓ'i ve ekipman verim değişimini içermez. Günlük tasarrufun "
+    f"H₂ payı {format_number(totals['h2_saved_gas_day_nm3'])} Nm³, atık ısı senaryo payı "
+    f"{format_number(totals['heat_saved_gas_day_nm3'])} Nm³'dir."
 )
 
-tab_dispatch, tab_circular, tab_edge, tab_finance, tab_model = st.tabs(
-    ["24 saat dispatch", "Çifte dairesel ekonomi", "Edge telemetri görünümü", "💶 Finansal analiz", "Model ve kabuller"]
+tab_dispatch, tab_circular, tab_heat, tab_edge, tab_targets, tab_finance, tab_model = st.tabs(
+    [
+        "24 saat dispatch",
+        "Çifte dairesel ekonomi",
+        "Atık ısı deposu",
+        "Edge telemetri görünümü",
+        "Hedef ve darboğaz",
+        "💶 Finansal analiz",
+        "Model ve kabuller",
+    ]
 )
 
 
@@ -676,13 +1122,26 @@ with tab_dispatch:
         chart.add_trace(
             go.Scatter(
                 x=scenario["Saat"],
+                y=scenario["Atık ısı sonrası brülör doğalgaz referansı (Nm³/saat)"],
+                name="Atık ısı sonrası NG ihtiyacı",
+                mode="lines",
+                line=dict(color=AMBER, width=2.5, dash="dash"),
+                fill="tonexty",
+                fillcolor="rgba(217,145,25,.10)",
+                hovertemplate="%{x}<br>Isı geri kazanımı sonrası: %{y:,.1f} Nm³/saat<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        chart.add_trace(
+            go.Scatter(
+                x=scenario["Saat"],
                 y=scenario["Senaryo doğalgazı (Nm³/saat)"],
-                name="Senaryo doğalgazı",
+                name="OptiHydro senaryo doğalgazı",
                 mode="lines",
                 line=dict(color=TEAL, width=3),
                 fill="tonexty",
-                fillcolor="rgba(0,153,153,.10)",
-                hovertemplate="%{x}<br>Doğalgaz: %{y:,.1f} Nm³/saat<extra></extra>",
+                fillcolor="rgba(0,153,153,.12)",
+                hovertemplate="%{x}<br>Senaryo NG: %{y:,.1f} Nm³/saat<extra></extra>",
             ),
             secondary_y=False,
         )
@@ -701,7 +1160,7 @@ with tab_dispatch:
         chart.update_yaxes(title_text="Doğalgaz debisi (Nm³/saat)", secondary_y=False)
         chart.update_yaxes(title_text="H₂ oranı (vol %)", secondary_y=True, rangemode="tozero")
         chart.update_xaxes(title_text="Saat")
-        chart.update_layout(title="Aynı termal girdiyi koruyan 24 saatlik senaryo")
+        chart.update_layout(title="Yararlı proses ısısını koruyan 24 saatlik senaryo")
         st.plotly_chart(style_figure(chart, 410), width="stretch")
 
     with right:
@@ -710,7 +1169,7 @@ with tab_dispatch:
         emissions_fig = go.Figure(
             data=[
                 go.Bar(
-                    x=["Baz", "H₂ senaryosu"],
+                    x=["Baz", "H₂ + atık ısı"],
                     y=[totals["baseline_co2_day_t"], totals["projected_co2_day_t"]],
                     marker_color=["#9aa9b6", TEAL],
                     text=[
@@ -740,8 +1199,11 @@ with tab_dispatch:
                 "Yeşil enerji erişilebilirlik indeksi (%)",
                 "H2 harmanlama (vol %)",
                 "Senaryo doğalgazı (Nm³/saat)",
-                "Önlenen doğalgaz (Nm³/saat)",
+                "H2 ile önlenen doğalgaz (Nm³/saat)",
+                "Atık ısıyla önlenen doğalgaz (Nm³/saat)",
+                "Toplam önlenen doğalgaz (Nm³/saat)",
                 "H2 tüketimi (kg/saat)",
+                "Faydalı atık ısı (kWhth/saat)",
                 "Proses suyu (L/saat)",
             ]
         ].round(2),
@@ -953,7 +1415,114 @@ with tab_circular:
 
 
 # -----------------------------------------------------------------------------
-# Tab 3 — Edge-facing model view, carefully separated from live telemetry
+# Tab 3 — waste heat recovery and thermal storage
+# -----------------------------------------------------------------------------
+with tab_heat:
+    st.markdown("<div class='section-label'>DÜŞÜK SICAKLIKLI ISI GERİ KAZANIMI</div>", unsafe_allow_html=True)
+    st.subheader("Atık ısı deposu ve ön ısıtma yükü")
+    st.caption(
+        "Model, sıcak bölgeden bağımsız bir ön ısıtma yüküne doğrudan kullanım ve depolama sırasıyla ısı verir. "
+        "Varsayılan saatlik parti profili sentetiktir; sonuçlar ölçüm veya ekipman tasarımı yerine geçmez."
+    )
+
+    if heat_source_temperature_c <= heat_sink_temperature_c:
+        st.warning(
+            "Isı kaynağı sıcaklığı hedef yük sıcaklığından yüksek değil; bu senaryoda kullanılabilir ısı sıfıra indirilmiştir. "
+            "Gerçek eşanjör için yaklaşım sıcaklığı ve malzeme limitleri ayrıca doğrulanmalıdır.",
+            icon="🌡️",
+        )
+    elif heat_source_peak_kwth <= 0.0 or heat_demand_kwth <= 0.0:
+        st.info("Atık ısı kaynağı veya eşleşen ön ısıtma talebi sıfır; bu nedenle doğalgaz tasarrufuna ısı katkısı eklenmiyor.")
+
+    heat_demand_day_kwh = min(
+        heat_demand_kwth,
+        gas_flow * ng_lhv / 3.6 * furnace_efficiency_pct / 100.0,
+    ) * 24.0
+    heat_coverage_pct = (
+        totals["useful_heat_day_kwh"] / heat_demand_day_kwh * 100.0
+        if heat_demand_day_kwh > 0
+        else 0.0
+    )
+    heat_k1, heat_k2, heat_k3, heat_k4 = st.columns(4)
+    heat_k1.metric("Faydalı ısı", f"{format_number(totals['useful_heat_day_kwh'] / 1000.0, 2)} MWhth/gün")
+    heat_k2.metric("Isı ile önlenen NG", f"{format_number(totals['heat_saved_gas_day_nm3'])} Nm³/gün")
+    heat_k3.metric("Ön ısıtma yükü karşılama", f"{format_number(min(100.0, heat_coverage_pct), 1)}%")
+    store_capacity = max(0.0, totals["thermal_store_capacity_kwh"])
+    heat_k4.metric(
+        "Gün sonu depo doluluğu",
+        f"{format_number(totals['thermal_store_end_kwh'])} kWhth",
+        f"kapasitenin %{format_number(totals['thermal_store_end_kwh'] / store_capacity * 100.0 if store_capacity else 0.0, 1)}'i",
+    )
+
+    heat_fig = make_subplots(specs=[[{"secondary_y": True}]])
+    heat_fig.add_trace(
+        go.Scatter(
+            x=heat_storage["Saat"],
+            y=heat_storage["Atık ısı kaynağı (kWth)"],
+            name="Erişilebilir atık ısı",
+            line=dict(color=AMBER, width=2, dash="dot"),
+            hovertemplate="%{x}<br>Kaynak: %{y:.1f} kWth<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    heat_fig.add_trace(
+        go.Scatter(
+            x=heat_storage["Saat"],
+            y=heat_storage["Faydalı ısı (kWhth)"],
+            name="Ön ısıtmaya verilen ısı",
+            line=dict(color=TEAL, width=3),
+            fill="tozeroy",
+            fillcolor="rgba(0,153,153,.10)",
+            hovertemplate="%{x}<br>Faydalı ısı: %{y:.1f} kWhth<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    heat_fig.add_trace(
+        go.Scatter(
+            x=heat_storage["Saat"],
+            y=heat_storage["Depo doluluğu (kWhth)"],
+            name="Depo doluluğu",
+            line=dict(color=NAVY, width=2.5),
+            hovertemplate="%{x}<br>Depo: %{y:.0f} kWhth<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    heat_fig.update_yaxes(title_text="Isı gücü / saatlik enerji (kWth / kWhth)", secondary_y=False, rangemode="tozero")
+    heat_fig.update_yaxes(title_text="Depo enerjisi (kWhth)", secondary_y=True, rangemode="tozero")
+    heat_fig.update_xaxes(title_text="Saat")
+    heat_fig.update_layout(title="Atık ısı kullanımı ve ısıl depo durumu")
+    st.plotly_chart(style_figure(heat_fig, 410), width="stretch")
+
+    heat_table = heat_storage[
+        [
+            "Saat",
+            "Atık ısı kaynağı (kWth)",
+            "Doğrudan kullanılan ısı (kWhth)",
+            "Depoya giren ısı (kWhth)",
+            "Depodan çıkan ısı (kWhth)",
+            "Faydalı ısı (kWhth)",
+            "Depo doluluğu (kWhth)",
+            "Kullanılmayan ısı (kWhth)",
+        ]
+    ].round(2)
+    st.dataframe(heat_table, width="stretch", hide_index=True)
+    st.download_button(
+        "Isıl depo saatlik dengesini CSV indir",
+        data=heat_table.to_csv(index=False).encode("utf-8-sig"),
+        file_name="optihydro_thermal_storage_24h.csv",
+        mime="text/csv",
+        icon="⬇️",
+    )
+    st.markdown(
+        "<div class='soft-card'><h4>Model sınırı</h4><p>Isı depolama bu MVP'de yalnızca sıcaklığı uygun bir ön ısıtma talebini besler. "
+        "Eşanjör basınç kaybı, kirlenme, gerçek sıcaklık profili, termal ortam seçimi, saha yerleşimi ve 1.000°C+ sıcak bölgenin güvenliği modellenmez. "
+        "Varsayılan kaynak/depo değerleri örnek girdilerdir; doğrulanmış tesis tasarımı veya tasarruf garantisi değildir.</p></div>",
+        unsafe_allow_html=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Tab 4 — Edge-facing model view, carefully separated from live telemetry
 # -----------------------------------------------------------------------------
 with tab_edge:
     st.markdown("<div class='section-label'>SİEMENS EDGE'E UYGUN ÜRÜN KONSEPTİ</div>", unsafe_allow_html=True)
@@ -971,7 +1540,7 @@ with tab_edge:
     edge_a, edge_b, edge_c = st.columns(3)
     edge_a.metric("Fırın senaryo sıcaklığı", f"{int(furnace_temperature)} °C", "kullanıcı girdisi")
     edge_b.metric("H₂ dispatch ortalaması", f"{format_number(totals['mean_blend_pct'], 2)} vol %", "model çıktısı")
-    edge_c.metric("Öngörülen doğalgaz debisi", f"{format_number(totals['projected_gas_day_nm3']/24, 1)} Nm³/saat", "sabit termal girdi")
+    edge_c.metric("Öngörülen doğalgaz debisi", f"{format_number(totals['projected_gas_day_nm3']/24, 1)} Nm³/saat", "eşlenmiş faydalı ısı yükü")
 
     st.markdown("#### Model çıkışları / entegrasyon gereksinimleri")
     telemetry_rows = [
@@ -1007,7 +1576,140 @@ with tab_edge:
 
 
 # -----------------------------------------------------------------------------
-# Tab 4 — financial scenario, with conditional CBAM exposure proxy
+# Tab 5 — target feasibility and constraint attribution
+# -----------------------------------------------------------------------------
+with tab_targets:
+    st.markdown("<div class='section-label'>HEDEFİN FİZİKSEL UYGULANABİLİRLİĞİ</div>", unsafe_allow_html=True)
+    st.subheader("Hedef tasarrufa hangi kaynaklarla ulaşılır?")
+    st.caption(
+        "H₂ gereksinimi, aynı proses ısısını koruyan doğalgaz/hidrojen alt ısıl değer dengesiyle hesaplanır. "
+        "Isı geri kazanımının mevcut senaryodaki katkısı ayrıca gösterilir."
+    )
+
+    target_col1, target_col2, target_col3, target_col4 = st.columns(4)
+    target_col1.metric(
+        "Hedef için H₂ harmanı*",
+        f"{format_number(target_blend_fraction * 100.0, 1)} vol %",
+        "H₂ tek başına",
+    )
+    target_col2.metric(
+        "Sürekli H₂ ihtiyacı*",
+        f"{format_number(target_h2_kg_h, 1)} kg/saat",
+        f"mevcut besleme {format_number(h2_supply, 1)} kg/saat",
+    )
+    target_col3.metric(
+        "Elektrolizör gücü*",
+        f"{format_number(target_electrolyzer_kw)} kW",
+        f"gerekli yeşil pik ≈ {target_required_green_peak_display}",
+    )
+    target_col4.metric(
+        "Toplam H₂ su ihtiyacı*",
+        f"{format_number(target_water_l_h)} L/saat",
+        f"mevcut kondensat {format_number(condensate)} L/saat",
+    )
+
+    if gas_flow <= 0.0:
+        st.info(
+            "Baz doğalgaz debisi 0 seçildiği için hedef ikame için H₂, elektrik ve su gereksinimi oluşmuyor. "
+            "Kaynak darboğazı değerlendirmesi yapabilmek için pozitif bir fırın yükü girin."
+        )
+    elif not target_h2_only_feasible_under_cap:
+        st.warning(
+            f"Seçilen %{format_number(target_savings_pct)} doğalgaz ikamesi H₂ ile tek başına hedeflenirse yaklaşık "
+            f"%{format_number(target_blend_fraction * 100.0, 1)} vol H₂ gerekir; bu, bu demodaki "
+            f"%{format_number(effective_safety_cap_pct, 1)} harman tavanını aşar. H₂ dışı ısı verimliliği, "
+            "uygun atık ısı geri kazanımı veya farklı proses önlemleri gerekir. Bu tavan standart onayı değildir."
+        )
+    else:
+        st.info(
+            "Hedef blend oranı demo tavanının altında; hedef yine de H₂ beslemesi, elektrik, su, saatlik profil "
+            "ve proses uygunluğu kısıtlarıyla ayrıca doğrulanmalıdır."
+        )
+    if gas_flow > 0.0 and target_bottleneck_name == "H₂ harman tavanı":
+        st.info(
+            f"Seçilen hedef için ilk fiziksel engel H₂ hacim tavanıdır. H₂ dışı ısı geri kazanımı mevcut senaryoda "
+            f"doğalgaz ikamesine %{format_number(totals['heat_saving_pct'], 1)} katkı sağlıyor; "
+            f"mevcut toplam sonuç %{format_number(totals['gas_saving_pct'], 1)}."
+        )
+    elif gas_flow > 0.0:
+        st.info(
+            f"H₂ ile hedef gereksinimindeki en dar kaynak: {target_bottleneck_name} "
+            f"(%{format_number(target_bottleneck_coverage_pct, 1)} kapasite karşılaması)."
+        )
+
+    target_gap_col, max_h2_col, actual_col = st.columns(3)
+    target_gap_col.metric(
+        "Mevcut senaryodan hedefe kalan",
+        f"{format_number(target_gap_after_scenario_nm3_day)} Nm³/gün",
+        f"yaklaşık {format_number(target_gap_heat_mwh_day, 2)} MWhth/gün faydalı ısı eşdeğeri",
+    )
+    max_h2_col.metric(
+        "Demo tavanında H₂'nin teorik üst sınırı",
+        f"%{format_number(totals['theoretical_safety_gas_saving_pct'], 1)} NG ikamesi",
+        "sürekli ve diğer kaynaklar sınırsız varsayımı",
+    )
+    actual_col.metric(
+        "Girdilerle hesaplanan toplam sonuç",
+        f"%{format_number(totals['gas_saving_pct'], 1)} NG ikamesi",
+        f"H₂ %{format_number(totals['h2_saving_pct'], 1)} + ısı %{format_number(totals['heat_saving_pct'], 1)}",
+    )
+
+    target_fig = go.Figure(
+        data=[
+            go.Bar(
+                x=["Mevcut senaryo\nH₂ + atık ısı", "H₂ tavanı\nteorik üst sınır", "Seçilen hedef"],
+                y=[
+                    totals["gas_saving_pct"],
+                    totals["theoretical_safety_gas_saving_pct"],
+                    float(target_savings_pct),
+                ],
+                marker_color=[TEAL, AMBER, NAVY],
+                text=[
+                    f"{totals['gas_saving_pct']:.1f}%",
+                    f"{totals['theoretical_safety_gas_saving_pct']:.1f}%",
+                    f"{float(target_savings_pct):.1f}%",
+                ],
+                textposition="outside",
+                hovertemplate="%{x}<br>Doğalgaz ikamesi: %{y:.2f}%<extra></extra>",
+            )
+        ]
+    )
+    target_fig.update_layout(title="Gerçek senaryo, H₂ tavanı ve hedef karşılaştırması", showlegend=False, yaxis_title="Baz NG debisine göre ikame (%)")
+    target_fig.update_yaxes(
+        rangemode="tozero",
+        range=[
+            0,
+            max(
+                12.0,
+                target_savings_pct * 1.25,
+                totals["theoretical_safety_gas_saving_pct"] * 1.25,
+                totals["gas_saving_pct"] * 1.25,
+            ),
+        ],
+    )
+    st.plotly_chart(style_figure(target_fig, 350), width="stretch")
+
+    resource_rows = [
+        ("Gerekli H₂ harmanı (yalnız H₂ ile)", f"%{format_number(target_blend_fraction * 100.0, 1)} vol", f"demo tavanı %{format_number(effective_safety_cap_pct, 1)} vol"),
+        ("Sürekli H₂ beslemesi", f"{format_number(target_h2_kg_h, 1)} kg/saat", f"{format_number(h2_supply, 1)} kg/saat mevcut"),
+        ("Elektrolizör elektrik yükü", f"{format_number(target_electrolyzer_kw)} kW", f"{format_number(totals['effective_peak_power_kw'])} kW mevcut tepe"),
+        ("Yeşil elektrik pik gücü girdisi", target_required_green_peak_display, f"{format_number(renewable_surplus_peak_kw)} kW senaryo girdisi"),
+        ("Sürekli elektroliz suyu", f"{format_number(target_water_l_h)} L/saat", f"{format_number(condensate)} L/saat kondensat"),
+        ("Mevcut senaryodaki atık ısı katkısı", f"{format_number(totals['heat_saved_gas_day_nm3'])} Nm³/gün", f"{format_number(totals['useful_heat_day_kwh'] / 1000.0, 2)} MWhth/gün faydalı"),
+    ]
+    st.dataframe(
+        pd.DataFrame(resource_rows, columns=["Kısıt", "Hedef gereksinimi", "Mevcut senaryo"]),
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(
+        "* Bu gereksinimler seçilen gaz ikamesini yalnızca H₂ ile ve sürekli yükte karşılama varsayımıdır. "
+        "Gerçek planlama saatlik yeşil enerji, gaz bileşimi, brülör/OEM limitleri, ölçülmüş ısı profili ve proses talebiyle yapılmalıdır."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Tab 6 — financial scenario, with conditional CBAM exposure proxy
 # -----------------------------------------------------------------------------
 with tab_finance:
     st.markdown("<div class='section-label'>FİNANSAL SENARYO · KULLANICI GİRDİLERİ</div>", unsafe_allow_html=True)
@@ -1040,10 +1742,12 @@ with tab_finance:
     else:
         payback_value = f"{format_number(payback_years, 2)} yıl"
         payback_delta = "1,2 yıl hedefinin altında" if payback_years <= 1.2 else "1,2 yıl hedefinin üzerinde"
-    fin4.metric("Basit yazılım geri ödeme süresi", payback_value, payback_delta)
+    fin4.metric("Basit toplam sistem geri ödeme süresi", payback_value, payback_delta)
 
     financial_rows = [
-        ("Günlük doğalgaz tasarrufu", f"{format_number(totals['saved_gas_day_nm3'])} Nm³/gün"),
+        ("Günlük toplam doğalgaz tasarrufu", f"{format_number(totals['saved_gas_day_nm3'])} Nm³/gün"),
+        ("H₂ kaynaklı tasarruf", f"{format_number(totals['h2_saved_gas_day_nm3'])} Nm³/gün"),
+        ("Atık ısı kaynaklı tasarruf", f"{format_number(totals['heat_saved_gas_day_nm3'])} Nm³/gün"),
         ("Yıllık yakıt tasarrufu", f"{format_number(totals['saved_gas_day_nm3'] * int(operating_days))} Nm³/yıl"),
         ("Doğalgaz fiyat varsayımı", f"{format_number(natural_gas_price_try_nm3, 2)} TL/Nm³"),
         ("EUR/TRY senaryo kuru", f"{format_number(eur_try, 2)} TL/€"),
@@ -1052,8 +1756,18 @@ with tab_finance:
         ("CBAM fiyat varsayımı", f"€{format_number(cbam_price_eur_t, 2)}/tCO₂"),
         ("Uygun AB ürünü emisyon tahsisi", f"%{format_number(cbam_eligible_share_pct)}"),
         ("CBAM senaryo farkı", f"€{format_number(annual_cbam_scenario_eur)} / yıl"),
-        ("Tek seferlik yazılım/entegrasyon", f"€{format_number(software_setup_cost_eur)}"),
+        ("Yazılım / entegrasyon CAPEX", f"€{format_number(software_setup_cost_eur)}"),
+        ("Elektrolizör CAPEX", f"€{format_number(electrolyzer_capex_eur)}"),
+        ("H₂ şartlandırma / depolama CAPEX", f"€{format_number(hydrogen_system_capex_eur)}"),
+        ("Su arıtma CAPEX", f"€{format_number(water_system_capex_eur)}"),
+        ("Isıl depo ve eşanjör CAPEX", f"€{format_number(thermal_storage_capex_eur)}"),
+        ("Diğer saha CAPEX", f"€{format_number(other_site_capex_eur)}"),
+        ("Toplam sistem CAPEX", f"€{format_number(total_system_capex_eur)}"),
+        ("Yıllık H₂ elektriği tüketimi", f"{format_number(annual_hydrogen_electricity_mwh)} MWh/yıl"),
+        ("Elektrik fırsat maliyeti", f"€{format_number(annual_electricity_cost_eur)} / yıl"),
         ("Yıllık lisans / OPEX", f"€{format_number(annual_software_opex_eur)}"),
+        ("Yıllık saha bakım / işletme OPEX", f"€{format_number(annual_plant_opex_eur)}"),
+        ("Toplam yıllık OPEX (elektrik dahil)", f"€{format_number(annual_total_opex_eur)}"),
         ("Yıllık net senaryo faydası", f"€{format_number(annual_net_financial_gain_eur)}"),
     ]
     st.dataframe(
@@ -1076,23 +1790,25 @@ with tab_finance:
             icon="⚠️",
         )
 
-    if software_setup_cost_eur <= 0:
+    if total_system_capex_eur <= 0:
         st.caption(
-            "1,2 yıl değeri bir hedef eşiğidir; maliyet girilmediği için gerçekleşen amortisman "
-            "hesaplanmamıştır. Sıfır CAPEX iddiası lisans, entegrasyon, elektrolizör ve saha emniyet "
-            "altyapısı maliyetlerini kendiliğinden sıfırlamaz."
+            "1,2 yıl değeri bir hedef eşiğidir; toplam sistem CAPEX'i girilmediği için gerçekleşen "
+            "geri ödeme hesaplanmamıştır. Yazılım retrofit yaklaşımı elektrolizör, H₂ depolama, "
+            "su arıtma ve saha emniyet altyapısı maliyetlerini sıfırlamaz."
         )
     elif annual_net_financial_gain_eur <= 0:
         st.error("Yıllık lisans/OPEX, senaryo faydasına eşit veya daha yüksek; geri ödeme oluşmuyor.")
 
     st.markdown(
-        "**Hesap:** Yakıt € = günlük ikame Nm³ × işletme günü × TL/Nm³ ÷ TL/€; "
-        "CBAM senaryo € = yıllık önlenen doğrudan CO₂ × uygun ürün tahsis payı × €/tCO₂."
+        "**Hesap:** Yakıt € = günlük toplam ikame Nm³ × işletme günü × TL/Nm³ ÷ TL/€; "
+        "CBAM senaryo € = yıllık önlenen doğrudan CO₂ × uygun ürün tahsis payı × €/tCO₂; "
+        "net fayda = yakıt + CBAM senaryosu − elektrik fırsat maliyeti − yıllık OPEX. "
+        "Elektrik fiyatı 0 ise yalnızca gerçekten kısıntı/fazla enerji kabulünde kullanın."
     )
 
 
 # -----------------------------------------------------------------------------
-# Tab 5 — assumptions and equations
+# Tab 7 — assumptions and equations
 # -----------------------------------------------------------------------------
 with tab_model:
     st.markdown("<div class='section-label'>ŞEFFAF HESAPLAMA</div>", unsafe_allow_html=True)
@@ -1114,7 +1830,15 @@ with tab_model:
         "H₂ **hacim yüzdesi**, ikame edilen doğalgaz **enerji yüzdesi** değildir; H₂'nin hacim başına LHV'si daha düşüktür."
     )
     st.latex(r"m_{H_2}=\dot V_{H_2}\rho_{H_2};\quad W_{process}=m_{H_2}\,w_{L/kg};\quad m_{O_2,stoich}=8m_{H_2}")
-    st.latex(r"CO_{2,avoided}=\Delta V_{NG}\,EF_{NG}")
+    st.latex(r"s_{NG}=1-\frac{(1-x)L_{NG}}{xL_{H_2}+(1-x)L_{NG}}")
+    st.latex(r"SOC_{t+1}=\min(C,\ (SOC_t(1-\lambda)-Q_{dis}/\eta_{dis})_+ + Q_{ch}\eta_{ch})")
+    st.latex(r"CO_{2,avoided}=(\Delta V_{NG,H_2}+\Delta V_{NG,heat})EF_{NG}")
+    st.markdown(
+        "Hedef sekmesi, istenen gaz hacmi ikamesi için gereken H₂ hacim oranını ve sürekli H₂/su/güç ihtiyacını "
+        "ayrı hesaplar. Seçili demo harman tavanında H₂ tek başına teorik olarak en fazla "
+        f"%{format_number(totals['theoretical_safety_gas_saving_pct'], 1)} doğalgaz hacim ikamesi sağlar; "
+        "bu değer tesis güvenlik onayı değildir."
+    )
 
     st.markdown("#### Varsayımlar")
     assumptions = [
@@ -1124,12 +1848,18 @@ with tab_model:
         f"O₂ yan ürün kütlesi: yaklaşık 8 kg O₂/kg H₂. Arıtmada faydalı sayılan miktar, ayarlanabilir etkin kullanım oranı ve tesis O₂ ihtiyacının küçüğüdür.",
         "Fan elektrik tasarrufu, kredilendirilen O₂ ihtiyacının fan gücüyle doğrusal ölçeklendiği basit senaryodur; blower performans eğrisi veya kütle transfer modeli değildir.",
         f"H₂ dispatch tavanı, kullanıcı girişinin min({format_number(H2_SIMULATION_HARD_CAP_PCT, 1)} vol %, girilen değer) olarak uygulanır. %20, bu MVP için seçilmiş demo kuralıdır; EN 746-2 veya ATEX'in tüm tesislere koyduğu evrensel harman limiti değildir ve flashback emniyet sistemi sayılmaz.",
+        f"H₂ setpoint değişimi saatte en fazla {format_number(max_ramp_pct_per_hour, 2)} yüzde puanla sınırlandırılır; bu demo varsayımı OEM veya emniyet PLC limitinin yerine geçmez.",
         f"Yeşil enerji profili sentetik ve normalize edilmiş günlük şekildir; saatlik elektroliz gücü ayrıca {format_number(renewable_surplus_peak_kw)} kW pik giriş × bu profil ile kısıtlanır. Gerçek şebeke/RES/GES tahmini veya hava durumu kullanılmıyor.",
+        f"Isı kaynağı profili: {heat_source_profile_name}; pik {format_number(heat_source_peak_kwth)} kWth, hedef ön ısıtma yükü {format_number(heat_demand_kwth)} kWth, depo {format_number(heat_storage_capacity_kwhth)} kWhth. Bunlar değiştirilebilir demo varsayımlarıdır; ölçüm veya eşanjör tasarımı değildir.",
+        f"Atık ısı yalnızca kaynak sıcaklığı ({format_number(heat_source_temperature_c)} °C) hedef yükten ({format_number(heat_sink_temperature_c)} °C) yüksekse kullanılabilir kabul edilir; gerçek sıcaklık yaklaşımı, malzeme ve kirlenme sınırları modellenmez.",
+        f"Ön ısıtma ısısının doğalgaz eşdeğerine çevrimi baz fırın yararlı ısı verimi %{format_number(furnace_efficiency_pct, 1)} varsayımını kullanır.",
+        "Isı deposu saatlik modelinde önce doğrudan ısı kullanılır, sonra mevcut stok deşarj edilir ve kalan kaynakla depo şarj edilir. Depo gün sonu enerjisi gaz tasarrufu sayılmaz; yalnızca prosese verilen faydalı ısı NG eşdeğerine çevrilir.",
         "Scope 1 metriği yalnızca doğalgazın doğrudan yanma CO₂'sini kapsar. H₂ üretim elektriği ve yaşam döngüsü emisyonları düşülmez; NOₓ ve proses etkileri modellenmez.",
-        "Software retrofit, fırın yenilemesini gerektirmeyebilir; ancak elektrolizör, su şartlandırma, H₂ depolama/sıkıştırma, gaz treni ve emniyet altyapısının CAPEX/OPEX'i bu uygulamada hesaplanmaz.",
+        "Isı geri kazanımı ve H₂ kaynaklı doğalgaz ikamesi ayrı hesaplanır; yalnızca kullanılan faydalı ısı toplam tasarrufa eklenir. Isı etkisi saha testiyle doğrulanmalıdır.",
         f"Finans varsayımları kullanıcı girdisidir: {format_number(natural_gas_price_try_nm3, 2)} TL/Nm³, {format_number(eur_try, 2)} TL/€, {format_number(cbam_price_eur_t, 2)} €/tCO₂ ve {int(operating_days)} işletme günü/yıl. Güncel piyasa veya CBAM sertifika fiyatı iddiası değildir.",
         f"CBAM senaryo faydası yalnızca kullanıcı tarafından tahsis edilen %{format_number(cbam_eligible_share_pct, 1)} emisyon payına uygulanır; kapsam içi AB ithalatı/ürünü ve doğrulanmış gömülü emisyonlar yoksa uygun pay %0 olmalıdır. Uygulama, gerçek mevzuat yükümlülüğünü hesaplamaz.",
-        "Basit geri ödeme, girilen kurulum bedelinin (yakıt + CBAM senaryo faydası − yıllık yazılım OPEX'i) değerine bölünmesidir. ≤1,2 yıl hedef olarak gösterilir; maliyet girdisi ve saha teklifi olmadan ROI iddiası değildir.",
+        "Toplam CAPEX; yazılım, elektrolizör, H₂, su, termal depo ve saha girdilerinin toplamıdır. Net yıllık faydadan H₂ elektriği fırsat maliyeti ve yıllık OPEX düşülür.",
+        "Basit geri ödeme, toplam CAPEX'in (yakıt + CBAM senaryo faydası − elektrik fırsat maliyeti − yıllık OPEX) değerine bölünmesidir. ≤1,2 yıl hedef olarak gösterilir; maliyet girdisi ve saha teklifi olmadan ROI iddiası değildir.",
     ]
     for item in assumptions:
         st.markdown(f"- {item}")
