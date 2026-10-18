@@ -93,6 +93,7 @@ H2_LHV_KWH_PER_KG = 33.3
 H2_LHV_MJ_PER_NM3 = H2_LHV_KWH_PER_KG * 3.6 * H2_DENSITY_KG_PER_NM3
 H2_WATER_STOICH_KG_PER_KG = 9.0
 H2_OXYGEN_STOICH_KG_PER_KG = 8.0
+H2_SIMULATION_HARD_CAP_PCT = 20.0
 IPCC_NG_CO2_KG_PER_GJ = 56.1
 DEFAULT_NG_LHV_MJ_PER_NM3 = 35.8
 DEFAULT_NG_CO2_KG_PER_NM3 = (
@@ -154,7 +155,7 @@ def renewable_availability_profile(peak_index_pct: float) -> np.ndarray:
 def optimize_blend_schedule(
     availability: np.ndarray,
     safety_cap_fraction: float,
-    supply_cap_fraction: float,
+    hourly_supply_cap_fractions: np.ndarray,
     ng_lhv_mj_nm3: float,
     h2_lhv_mj_nm3: float = H2_LHV_MJ_PER_NM3,
 ) -> np.ndarray:
@@ -164,7 +165,10 @@ def optimize_blend_schedule(
     higher-availability hours and applies a modest penalty to setpoint changes.
     This is an explainable deterministic optimizer, not a trained AI forecast.
     """
-    upper_bound = max(0.0, min(safety_cap_fraction, supply_cap_fraction))
+    max_hourly_supply_cap = (
+        float(np.max(hourly_supply_cap_fractions)) if hourly_supply_cap_fractions.size else 0.0
+    )
+    upper_bound = max(0.0, min(safety_cap_fraction, max_hourly_supply_cap))
     step = 0.0025  # 0.25 vol-percentage-point resolution
     candidates = np.arange(0.0, upper_bound + step / 2.0, step)
     if candidates.size == 0 or candidates[-1] < upper_bound - 1e-9:
@@ -177,7 +181,11 @@ def optimize_blend_schedule(
     ramp_penalty = 0.10
 
     for hour in range(hour_count):
-        allowed = min(upper_bound, safety_cap_fraction * float(availability[hour]))
+        allowed = min(
+            upper_bound,
+            safety_cap_fraction * float(availability[hour]),
+            float(hourly_supply_cap_fractions[hour]),
+        )
         feasible = candidates <= allowed + 1e-10
         energy_share = np.zeros(state_count)
         denominator = candidates * h2_lhv_mj_nm3 + (1.0 - candidates) * ng_lhv_mj_nm3
@@ -219,6 +227,7 @@ def create_scenario(
     peak_index_pct: float,
     safety_cap_pct: float,
     external_h2_supply_kg_h: float,
+    renewable_surplus_peak_kw: float,
     condensate_l_h: float,
     water_intensity_l_kg: float,
     ng_lhv_mj_nm3: float,
@@ -231,18 +240,28 @@ def create_scenario(
     furnace_temperature_c: int,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     availability = renewable_availability_profile(peak_index_pct)
-    safety_cap = safety_cap_pct / 100.0
+    # A project-configured demo ceiling, not a universal standard limit.
+    safety_cap = min(float(safety_cap_pct), H2_SIMULATION_HARD_CAP_PCT) / 100.0
 
     # External H2 availability and recovered-water treatment capacity both bind.
     water_limited_h2_kg_h = condensate_l_h / water_intensity_l_kg if water_intensity_l_kg else 0.0
     available_h2_kg_h = min(external_h2_supply_kg_h, water_limited_h2_kg_h)
-    available_h2_nm3_h = available_h2_kg_h / H2_DENSITY_KG_PER_NM3
-    supply_cap = blend_cap_from_h2_flow(
-        available_h2_nm3_h,
-        gas_flow_nm3_h,
-        ng_lhv_mj_nm3,
+    renewable_power_available_kw = renewable_surplus_peak_kw * availability
+    power_limited_h2_kg_h = renewable_power_available_kw / electrolyzer_kwh_kg
+    hourly_h2_supply_kg_h = np.minimum(available_h2_kg_h, power_limited_h2_kg_h)
+    hourly_supply_cap_fractions = np.array(
+        [
+            blend_cap_from_h2_flow(
+                h2_kg_h / H2_DENSITY_KG_PER_NM3,
+                gas_flow_nm3_h,
+                ng_lhv_mj_nm3,
+            )
+            for h2_kg_h in hourly_h2_supply_kg_h
+        ]
     )
-    blend = optimize_blend_schedule(availability, safety_cap, supply_cap, ng_lhv_mj_nm3)
+    blend = optimize_blend_schedule(
+        availability, safety_cap, hourly_supply_cap_fractions, ng_lhv_mj_nm3
+    )
 
     rows: list[dict[str, Any]] = []
     for hour, blend_fraction in enumerate(blend):
@@ -276,6 +295,7 @@ def create_scenario(
                 "Üretilen O2 (kg/saat)": oxygen_generated_kg_h,
                 "Arıtmada kredilendirilen O2 (kg/saat)": oxygen_credited_kg_h,
                 "Elektroliz elektrik ihtiyacı (kWh/saat)": h2_kg_h * electrolyzer_kwh_kg,
+                "Yeşil enerji kullanılabilir gücü (kW)": renewable_power_available_kw[hour],
                 "Havalandırma fan gücü senaryosu (kW)": aeration_fan_kw
                 * oxygen_displacement_fraction,
                 "Önlenen doğrudan CO2 (kg/saat)": ng_avoided_nm3_h * ng_co2_kg_nm3,
@@ -296,6 +316,7 @@ def create_scenario(
     mean_blend_pct = float(frame["H2 harmanlama (vol %)"].mean())
     peak_blend_pct = float(frame["H2 harmanlama (vol %)"].max())
     green_h2_power_day_kwh = h2_day_kg * electrolyzer_kwh_kg
+    green_power_available_day_kwh = float(renewable_power_available_kw.sum())
 
     summary = {
         "baseline_gas_day_nm3": baseline_gas_day,
@@ -323,6 +344,10 @@ def create_scenario(
         "mean_blend_pct": mean_blend_pct,
         "peak_blend_pct": peak_blend_pct,
         "green_h2_power_day_mwh": green_h2_power_day_kwh / 1000.0,
+        "green_power_available_day_mwh": green_power_available_day_kwh / 1000.0,
+        "green_power_utilization_pct": green_h2_power_day_kwh / green_power_available_day_kwh * 100.0
+        if green_power_available_day_kwh > 0
+        else 0.0,
         "operating_days": float(operating_days),
         "furnace_temperature_c": float(furnace_temperature_c),
         "available_h2_kg_h": available_h2_kg_h,
@@ -375,12 +400,20 @@ with st.sidebar:
         value=72,
         help="Sentetik günlük erişilebilirlik eğrisinin tepe değeridir; gerçek şebeke tahmini değildir.",
     )
+    renewable_surplus_peak_kw = st.number_input(
+        "Yeşil elektrik fazlası pik gücü (kW)",
+        min_value=0.0,
+        max_value=100000.0,
+        value=1800.0,
+        step=50.0,
+        help="Model saatlik elektrolizör tüketimini bu güç × sentetik erişilebilirlik profiliyle sınırlar.",
+    )
     safety_cap_pct = st.slider(
-        "Simülasyon harman üst sınırı (H₂ vol %)",
+        "İstenen H₂ harman üst sınırı (vol %)",
         min_value=0,
-        max_value=20,
+        max_value=30,
         value=20,
-        help="Model limiti. Fırın/brülör OEM onayı ve proses emniyet doğrulamasının yerine geçmez.",
+        help="Bu prototipin sabit dispatch tavanı %20'dir; daha yüksek girdiler simülasyonda bu tavana kesilir.",
     )
     h2_supply = st.number_input(
         "Kullanılabilir düşük karbonlu H₂ beslemesi (kg/saat)",
@@ -459,6 +492,52 @@ with st.sidebar:
             step=10.0,
         )
 
+    with st.expander("Finansal senaryo varsayımları", expanded=False):
+        natural_gas_price_try_nm3 = st.number_input(
+            "Doğalgaz birim fiyatı (TL/Nm³)",
+            min_value=0.0,
+            max_value=10000.0,
+            value=15.0,
+            step=0.5,
+        )
+        eur_try = st.number_input(
+            "EUR/TRY senaryo kuru (TL/€)",
+            min_value=0.01,
+            max_value=1000.0,
+            value=38.0,
+            step=0.5,
+            help="Sabit örnek senaryo girdisidir; güncel piyasa kuru değildir.",
+        )
+        cbam_price_eur_t = st.number_input(
+            "CBAM karbon fiyatı varsayımı (€/tCO₂)",
+            min_value=0.0,
+            max_value=5000.0,
+            value=80.0,
+            step=1.0,
+            help="Model varsayımıdır; CBAM sertifika fiyatı dönemsel olarak EU ETS'e göre belirlenir.",
+        )
+        cbam_eligible_share_pct = st.slider(
+            "Uygun AB CBAM ürünlerine tahsis edilen emisyon payı (%)",
+            min_value=0,
+            max_value=100,
+            value=0,
+            help="Ürün kapsamı ve doğrulanmış ürün emisyon tahsisi yoksa 0 bırakın.",
+        )
+        software_setup_cost_eur = st.number_input(
+            "Tek seferlik yazılım/entegrasyon bedeli (€)",
+            min_value=0.0,
+            max_value=100000000.0,
+            value=0.0,
+            step=5000.0,
+        )
+        annual_software_opex_eur = st.number_input(
+            "Yıllık lisans ve yazılım OPEX (€)",
+            min_value=0.0,
+            max_value=100000000.0,
+            value=0.0,
+            step=1000.0,
+        )
+
     st.divider()
     st.markdown(
         "<span class='status-chip gray'>Senaryo modu · canlı tesis bağlantısı yok</span>",
@@ -472,6 +551,7 @@ scenario, totals = create_scenario(
     peak_index_pct=green_peak,
     safety_cap_pct=safety_cap_pct,
     external_h2_supply_kg_h=h2_supply,
+    renewable_surplus_peak_kw=renewable_surplus_peak_kw,
     condensate_l_h=condensate,
     water_intensity_l_kg=water_intensity,
     ng_lhv_mj_nm3=ng_lhv,
@@ -482,6 +562,22 @@ scenario, totals = create_scenario(
     oxygen_use_efficiency=oxygen_use_pct / 100.0,
     aeration_fan_kw=aeration_fan_kw,
     furnace_temperature_c=int(furnace_temperature),
+)
+
+annual_fuel_savings_try = (
+    totals["saved_gas_day_nm3"] * int(operating_days) * natural_gas_price_try_nm3
+)
+annual_fuel_savings_eur = annual_fuel_savings_try / eur_try if eur_try > 0 else 0.0
+cbam_eligible_avoided_t = (
+    totals["avoided_co2_year_t"] * cbam_eligible_share_pct / 100.0
+)
+annual_cbam_scenario_eur = cbam_eligible_avoided_t * cbam_price_eur_t
+annual_gross_financial_gain_eur = annual_fuel_savings_eur + annual_cbam_scenario_eur
+annual_net_financial_gain_eur = annual_gross_financial_gain_eur - annual_software_opex_eur
+payback_years = (
+    software_setup_cost_eur / annual_net_financial_gain_eur
+    if software_setup_cost_eur > 0 and annual_net_financial_gain_eur > 0
+    else None
 )
 
 
@@ -502,6 +598,17 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+if float(safety_cap_pct) > H2_SIMULATION_HARD_CAP_PCT:
+    st.warning(
+        f"⚠️ **AI Safety Override Aktif (MVP kuralı):** Girilen %{format_number(float(safety_cap_pct), 1)} vol sınırı, "
+        f"bu prototipte tanımlı %{format_number(H2_SIMULATION_HARD_CAP_PCT, 1)} vol dispatch tavanını aşıyor. "
+        f"Simülasyon H₂ oranını %{format_number(H2_SIMULATION_HARD_CAP_PCT, 1)} vol ile sınırlar. "
+        "Bu deterministik demo tavanı EN 746-2/ATEX için evrensel bir izin veya emniyet sınırı değildir; gerçek limitler "
+        "uygulama, brülör üreticisi ve risk değerlendirmesiyle doğrulanır. Bu yazılım freni flashback'i "
+        "algılamaz veya önlemez.",
+        icon="⚠️",
+    )
 
 st.warning(
     "**Emniyet sınırı:** Bu MVP, fırın/brülör güvenlik sistemi değildir ve PLC'ye komut göndermez. "
@@ -541,8 +648,8 @@ st.caption(
     "elektroliz elektriğini, NOₓ'i ve ekipman verim değişimini içermez."
 )
 
-tab_dispatch, tab_circular, tab_edge, tab_model = st.tabs(
-    ["24 saat dispatch", "Çifte dairesel ekonomi", "Edge telemetri görünümü", "Model ve kabuller"]
+tab_dispatch, tab_circular, tab_edge, tab_finance, tab_model = st.tabs(
+    ["24 saat dispatch", "Çifte dairesel ekonomi", "Edge telemetri görünümü", "💶 Finansal analiz", "Model ve kabuller"]
 )
 
 
@@ -657,6 +764,115 @@ with tab_dispatch:
 with tab_circular:
     st.markdown("<div class='section-label'>KÜTLE DENGESİ</div>", unsafe_allow_html=True)
     st.subheader("Yoğuşma suyu → H₂ → O₂ değerlendirme senaryosu")
+
+    st.markdown("#### 🔄 Çifte dairesel akış şeması")
+    st.caption(
+        "Su ve elektrik farklı fiziksel birimler olduğu için akışları iki Sankey'de ayrı tutuyoruz: "
+        "solda kg/saat kütle dengesi, sağda kW enerji dengesi. Elektrik profili bu demoda sentetik erişilebilirlik indeksidir."
+    )
+    h2_average_kg_h = totals["h2_day_kg"] / 24.0
+    water_average_kg_h = totals["water_day_l"] / 24.0  # liquid water density ≈ 1 kg/L
+    oxygen_average_kg_h = totals["oxygen_day_kg"] / 24.0
+    process_residual_kg_h = max(
+        0.0, water_average_kg_h - h2_average_kg_h - oxygen_average_kg_h
+    )
+    electrolyzer_average_kw = totals["green_h2_power_day_mwh"] * 1000.0 / 24.0
+    hydrogen_lhv_output_kw = h2_average_kg_h * H2_LHV_KWH_PER_KG
+    electrolyzer_loss_kw = max(0.0, electrolyzer_average_kw - hydrogen_lhv_output_kw)
+
+    mass_sankey_col, energy_sankey_col = st.columns(2)
+    with mass_sankey_col:
+        if water_average_kg_h > 0:
+            mass_labels = [
+                f"Chiller kondensatı<br>{water_average_kg_h:.2f} kg/saat",
+                "Elektrolizör",
+                f"Yeşil H₂ · fırın yakıtı<br>{h2_average_kg_h:.2f} kg/saat",
+                f"Saf O₂ · arıtma yan ürünü<br>{oxygen_average_kg_h:.2f} kg/saat",
+                f"Proses suyu farkı<br>{process_residual_kg_h:.2f} kg/saat",
+            ]
+            mass_sources = [0, 1, 1, 1]
+            mass_targets = [1, 2, 3, 4]
+            mass_values = [
+                water_average_kg_h,
+                h2_average_kg_h,
+                oxygen_average_kg_h,
+                process_residual_kg_h,
+            ]
+            mass_colors = [
+                "rgba(0,153,153,.28)",
+                "rgba(0,153,153,.48)",
+                "rgba(122,181,216,.48)",
+                "rgba(150,160,170,.25)",
+            ]
+            mass_keep = [i for i, value in enumerate(mass_values) if value > 1e-9]
+            mass_sankey = go.Figure(
+                go.Sankey(
+                    arrangement="snap",
+                    node=dict(
+                        pad=20,
+                        thickness=19,
+                        line=dict(color="rgba(0,43,73,.18)", width=1),
+                        label=mass_labels,
+                        color=["#88cfc8", NAVY, TEAL, "#7ab5d8", "#d8dee5"],
+                    ),
+                    link=dict(
+                        source=[mass_sources[i] for i in mass_keep],
+                        target=[mass_targets[i] for i in mass_keep],
+                        value=[mass_values[i] for i in mass_keep],
+                        color=[mass_colors[i] for i in mass_keep],
+                        hovertemplate="%{value:.2f} kg/saat<extra></extra>",
+                    ),
+                )
+            )
+            mass_sankey.update_layout(title="Su ve yan ürün kütle dengesi · kg/saat")
+            st.plotly_chart(style_figure(mass_sankey, 350), width="stretch")
+        else:
+            st.info("Bu senaryoda elektrolizör üretimi yok; kütle akışları sıfır.")
+
+    with energy_sankey_col:
+        if electrolyzer_average_kw > 0:
+            energy_labels = [
+                f"GES/RES tahsisi · %{green_peak} tepe indeks<br>{electrolyzer_average_kw:.1f} kW",
+                "Elektrolizör",
+                f"H₂ kimyasal enerjisi<br>{hydrogen_lhv_output_kw:.1f} kW",
+                f"Dönüşüm kaybı<br>{electrolyzer_loss_kw:.1f} kW",
+            ]
+            energy_sources = [0, 1, 1]
+            energy_targets = [1, 2, 3]
+            energy_values = [
+                electrolyzer_average_kw,
+                hydrogen_lhv_output_kw,
+                electrolyzer_loss_kw,
+            ]
+            energy_colors = [
+                "rgba(217,145,25,.34)",
+                "rgba(0,153,153,.48)",
+                "rgba(150,160,170,.25)",
+            ]
+            energy_keep = [i for i, value in enumerate(energy_values) if value > 1e-9]
+            energy_sankey = go.Figure(
+                go.Sankey(
+                    arrangement="snap",
+                    node=dict(
+                        pad=20,
+                        thickness=19,
+                        line=dict(color="rgba(0,43,73,.18)", width=1),
+                        label=energy_labels,
+                        color=["#f1c56c", NAVY, TEAL, "#d8dee5"],
+                    ),
+                    link=dict(
+                        source=[energy_sources[i] for i in energy_keep],
+                        target=[energy_targets[i] for i in energy_keep],
+                        value=[energy_values[i] for i in energy_keep],
+                        color=[energy_colors[i] for i in energy_keep],
+                        hovertemplate="%{value:.1f} kW<extra></extra>",
+                    ),
+                )
+            )
+            energy_sankey.update_layout(title="Yenilenebilir elektrik ve H₂ enerji dengesi · kW")
+            st.plotly_chart(style_figure(energy_sankey, 350), width="stretch")
+        else:
+            st.info("Bu senaryoda elektrolizör elektrik talebi yok; enerji akışları sıfır.")
 
     water_used = totals["water_day_l"]
     water_available = totals["water_available_day_l"]
@@ -791,7 +1007,92 @@ with tab_edge:
 
 
 # -----------------------------------------------------------------------------
-# Tab 4 — assumptions and equations
+# Tab 4 — financial scenario, with conditional CBAM exposure proxy
+# -----------------------------------------------------------------------------
+with tab_finance:
+    st.markdown("<div class='section-label'>FİNANSAL SENARYO · KULLANICI GİRDİLERİ</div>", unsafe_allow_html=True)
+    st.subheader("Yakıt tasarrufu ve koşullu CBAM etkisi")
+    st.write(
+        "Aşağıdaki değerler sidebar'daki fiyat/kapsam varsayımlarından hesaplanır. CBAM kalemi, "
+        "sadece AB'ye ihraç edilen kapsam içi ürünlerin bu fırına tahsis edilebilen emisyon payı için "
+        "basitleştirilmiş bir fiyat senaryosudur; hukuki vergi veya sertifika yükümlülüğü hesabı değildir."
+    )
+
+    fin1, fin2, fin3, fin4 = st.columns(4)
+    fin1.metric(
+        "Yıllık doğalgaz maliyeti tasarrufu",
+        f"€{format_number(annual_fuel_savings_eur)}",
+        f"{format_number(annual_fuel_savings_try)} TL senaryo",
+    )
+    fin2.metric(
+        "CBAM senaryo farkı",
+        f"€{format_number(annual_cbam_scenario_eur)}",
+        f"{format_number(cbam_eligible_avoided_t, 1)} uygun ürün tCO₂/yıl",
+    )
+    fin3.metric(
+        "Brüt yıllık finansal fırsat",
+        f"€{format_number(annual_gross_financial_gain_eur)}",
+        "yakıt + CBAM senaryo farkı",
+    )
+    if payback_years is None:
+        payback_value = "Maliyet girdisi gerekli"
+        payback_delta = "ROI hedefi: ≤ 1,2 yıl"
+    else:
+        payback_value = f"{format_number(payback_years, 2)} yıl"
+        payback_delta = "1,2 yıl hedefinin altında" if payback_years <= 1.2 else "1,2 yıl hedefinin üzerinde"
+    fin4.metric("Basit yazılım geri ödeme süresi", payback_value, payback_delta)
+
+    financial_rows = [
+        ("Günlük doğalgaz tasarrufu", f"{format_number(totals['saved_gas_day_nm3'])} Nm³/gün"),
+        ("Yıllık yakıt tasarrufu", f"{format_number(totals['saved_gas_day_nm3'] * int(operating_days))} Nm³/yıl"),
+        ("Doğalgaz fiyat varsayımı", f"{format_number(natural_gas_price_try_nm3, 2)} TL/Nm³"),
+        ("EUR/TRY senaryo kuru", f"{format_number(eur_try, 2)} TL/€"),
+        ("Yıllık yakıt tasarrufu", f"€{format_number(annual_fuel_savings_eur)}"),
+        ("Yıllık doğrudan CO₂ azaltımı", f"{format_number(totals['avoided_co2_year_t'], 1)} t/yıl"),
+        ("CBAM fiyat varsayımı", f"€{format_number(cbam_price_eur_t, 2)}/tCO₂"),
+        ("Uygun AB ürünü emisyon tahsisi", f"%{format_number(cbam_eligible_share_pct)}"),
+        ("CBAM senaryo farkı", f"€{format_number(annual_cbam_scenario_eur)} / yıl"),
+        ("Tek seferlik yazılım/entegrasyon", f"€{format_number(software_setup_cost_eur)}"),
+        ("Yıllık lisans / OPEX", f"€{format_number(annual_software_opex_eur)}"),
+        ("Yıllık net senaryo faydası", f"€{format_number(annual_net_financial_gain_eur)}"),
+    ]
+    st.dataframe(
+        pd.DataFrame(financial_rows, columns=["Kalem", "Senaryo değeri"]),
+        width="stretch",
+        hide_index=True,
+    )
+
+    if cbam_eligible_share_pct <= 0:
+        st.info(
+            "CBAM payı %0 olduğu için toplam faydaya CBAM eklenmedi. Kapsam içi AB ihracatı ve "
+            "ürün bazında doğrulanmış emisyon tahsisi varsa bu payı senaryolaştırın."
+        )
+    else:
+        st.warning(
+            "CBAM rakamı yalnızca yaklaşık fiyat farkı senaryosudur. Gerçek CBAM; kapsam içi ithal "
+            "ürün, ürünün gömülü emisyonu, serbest tahsis düzeltmesi, üçüncü ülkede ödenen karbon "
+            "fiyatı ve doğrulama koşullarına bağlıdır. "
+            f"Buradaki €{format_number(cbam_price_eur_t, 2)}/t girdisi senaryo varsayımıdır, güncel resmi fiyat değildir.",
+            icon="⚠️",
+        )
+
+    if software_setup_cost_eur <= 0:
+        st.caption(
+            "1,2 yıl değeri bir hedef eşiğidir; maliyet girilmediği için gerçekleşen amortisman "
+            "hesaplanmamıştır. Sıfır CAPEX iddiası lisans, entegrasyon, elektrolizör ve saha emniyet "
+            "altyapısı maliyetlerini kendiliğinden sıfırlamaz."
+        )
+    elif annual_net_financial_gain_eur <= 0:
+        st.error("Yıllık lisans/OPEX, senaryo faydasına eşit veya daha yüksek; geri ödeme oluşmuyor.")
+
+    st.markdown(
+        "**Hesap:** Yakıt € = günlük ikame Nm³ × işletme günü × TL/Nm³ ÷ TL/€; "
+        "CBAM senaryo € = yıllık önlenen doğrudan CO₂ × uygun ürün tahsis payı × €/tCO₂."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Tab 5 — assumptions and equations
 # -----------------------------------------------------------------------------
 with tab_model:
     st.markdown("<div class='section-label'>ŞEFFAF HESAPLAMA</div>", unsafe_allow_html=True)
@@ -822,9 +1123,13 @@ with tab_model:
         f"H₂ elektroliz su bütçesi: {format_number(water_intensity, 1)} L/kg kullanıcı varsayımı; 9 kg/kg kimyasal stokiyometrik su ihtiyacını ve varsa ek proses payını ayırır.",
         f"O₂ yan ürün kütlesi: yaklaşık 8 kg O₂/kg H₂. Arıtmada faydalı sayılan miktar, ayarlanabilir etkin kullanım oranı ve tesis O₂ ihtiyacının küçüğüdür.",
         "Fan elektrik tasarrufu, kredilendirilen O₂ ihtiyacının fan gücüyle doğrusal ölçeklendiği basit senaryodur; blower performans eğrisi veya kütle transfer modeli değildir.",
-        "Yeşil enerji profili, sentetik ve normalize edilmiş günlük şekildir. Şebeke/RES/GES tahmini, üretim optimizasyonu veya gerçek zamanlı hava durumu kullanılmıyor.",
+        f"H₂ dispatch tavanı, kullanıcı girişinin min({format_number(H2_SIMULATION_HARD_CAP_PCT, 1)} vol %, girilen değer) olarak uygulanır. %20, bu MVP için seçilmiş demo kuralıdır; EN 746-2 veya ATEX'in tüm tesislere koyduğu evrensel harman limiti değildir ve flashback emniyet sistemi sayılmaz.",
+        f"Yeşil enerji profili sentetik ve normalize edilmiş günlük şekildir; saatlik elektroliz gücü ayrıca {format_number(renewable_surplus_peak_kw)} kW pik giriş × bu profil ile kısıtlanır. Gerçek şebeke/RES/GES tahmini veya hava durumu kullanılmıyor.",
         "Scope 1 metriği yalnızca doğalgazın doğrudan yanma CO₂'sini kapsar. H₂ üretim elektriği ve yaşam döngüsü emisyonları düşülmez; NOₓ ve proses etkileri modellenmez.",
         "Software retrofit, fırın yenilemesini gerektirmeyebilir; ancak elektrolizör, su şartlandırma, H₂ depolama/sıkıştırma, gaz treni ve emniyet altyapısının CAPEX/OPEX'i bu uygulamada hesaplanmaz.",
+        f"Finans varsayımları kullanıcı girdisidir: {format_number(natural_gas_price_try_nm3, 2)} TL/Nm³, {format_number(eur_try, 2)} TL/€, {format_number(cbam_price_eur_t, 2)} €/tCO₂ ve {int(operating_days)} işletme günü/yıl. Güncel piyasa veya CBAM sertifika fiyatı iddiası değildir.",
+        f"CBAM senaryo faydası yalnızca kullanıcı tarafından tahsis edilen %{format_number(cbam_eligible_share_pct, 1)} emisyon payına uygulanır; kapsam içi AB ithalatı/ürünü ve doğrulanmış gömülü emisyonlar yoksa uygun pay %0 olmalıdır. Uygulama, gerçek mevzuat yükümlülüğünü hesaplamaz.",
+        "Basit geri ödeme, girilen kurulum bedelinin (yakıt + CBAM senaryo faydası − yıllık yazılım OPEX'i) değerine bölünmesidir. ≤1,2 yıl hedef olarak gösterilir; maliyet girdisi ve saha teklifi olmadan ROI iddiası değildir.",
     ]
     for item in assumptions:
         st.markdown(f"- {item}")
@@ -833,7 +1138,10 @@ with tab_model:
     st.markdown(
         "- [IPCC 2006 Guidelines, Volume 2, Chapter 1 — Table 1.4](https://www.ipcc-nggip.iges.or.jp/public/2006gl/pdf/2_Volume2/V2_1_Ch1_Introduction.pdf): doğal gaz için 56.1 t CO₂/TJ varsayılan yanma faktörü.\n"
         "- [U.S. DOE — Hydrogen production: electrolysis](https://www.energy.gov/cmei/fuels/hydrogen-production-electrolysis): elektroliz suyu H₂ ve O₂'ye ayırır; gerçek sistem enerji tüketimi teknolojiye bağlıdır.\n"
-        "- [U.S. DOE — hydrogen technical targets](https://www.energy.gov/cmei/fuels/doe-technical-targets-onboard-hydrogen-storage-light-duty-vehicles): H₂ LHV için 33.3 kWh/kg değeri."
+        "- [U.S. DOE — hydrogen technical targets](https://www.energy.gov/cmei/fuels/doe-technical-targets-onboard-hydrogen-storage-light-duty-vehicles): H₂ LHV için 33.3 kWh/kg değeri.\n"
+        "- [DIN EN ISO 13577-2:2023](https://www.dinmedia.de/en/standard/din-en-iso-13577-2/353012773): endüstriyel fırın sistemlerinde yanma ve yakıt elleçleme emniyet gereklilikleri; bu referans tek başına evrensel bir H₂ harman yüzdesi belirlemez.\n"
+        "- [European Commission — CBAM definitive regime](https://taxation-customs.ec.europa.eu/carbon-border-adjustment-mechanism/cbam-definitive-regime_en): CBAM, kapsam içindeki AB'ye ithal edilen ürünlerin gömülü emisyonlarına uygulanır.\n"
+        "- [European Commission — CBAM certificate pricing](https://taxation-customs.ec.europa.eu/carbon-border-adjustment-mechanism/price-cbam-certificates_en): sertifika fiyatı EU ETS açık artırma fiyatlarına bağlıdır; uygulamadaki sabit fiyat yalnızca senaryo girdisidir."
     )
 
 st.divider()
